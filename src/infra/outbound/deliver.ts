@@ -1,4 +1,9 @@
 import {
+  markdownToSignalTextChunks,
+  type SignalTextStyleRange,
+} from "../../../extensions/signal/src/format.js";
+import { sendMessageSignal } from "../../../extensions/signal/src/send.js";
+import {
   chunkByParagraph,
   chunkMarkdownTextWithMode,
   resolveChunkMode,
@@ -10,6 +15,7 @@ import { loadChannelOutboundAdapter } from "../../channels/plugins/outbound/load
 import type {
   ChannelOutboundAdapter,
   ChannelOutboundContext,
+  ChannelThreadingToolContext,
 } from "../../channels/plugins/types.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { resolveMarkdownTableMode } from "../../config/markdown-tables.js";
@@ -17,7 +23,6 @@ import {
   appendAssistantMessageToSessionTranscript,
   resolveMirroredTranscriptText,
 } from "../../config/sessions.js";
-import type { sendMessageDiscord } from "../../discord/send.js";
 import { fireAndForgetHook } from "../../hooks/fire-and-forget.js";
 import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import {
@@ -26,56 +31,26 @@ import {
   toPluginMessageContext,
   toPluginMessageSentEvent,
 } from "../../hooks/message-hook-mappers.js";
-import type { sendMessageIMessage } from "../../imessage/send.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { getAgentScopedMediaLocalRoots } from "../../media/local-roots.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
-import { markdownToSignalTextChunks, type SignalTextStyleRange } from "../../signal/format.js";
-import { sendMessageSignal } from "../../signal/send.js";
-import type { sendMessageSlack } from "../../slack/send.js";
-import type { sendMessageTelegram } from "../../telegram/send.js";
-import type { sendMessageWhatsApp } from "../../web/outbound.js";
 import { throwIfAborted } from "./abort.js";
 import { ackDelivery, enqueueDelivery, failDelivery } from "./delivery-queue.js";
 import type { OutboundIdentity } from "./identity.js";
+import type { DeliveryMirror } from "./mirror.js";
 import type { NormalizedOutboundPayload } from "./payloads.js";
 import { normalizeReplyPayloadsForDelivery } from "./payloads.js";
 import { isPlainTextSurface, sanitizeForPlainText } from "./sanitize-text.js";
+import { resolveOutboundSendDep, type OutboundSendDeps } from "./send-deps.js";
 import type { OutboundSessionContext } from "./session-context.js";
 import type { OutboundChannel } from "./targets.js";
 
 export type { NormalizedOutboundPayload } from "./payloads.js";
 export { normalizeOutboundPayloads } from "./payloads.js";
+export { resolveOutboundSendDep, type OutboundSendDeps } from "./send-deps.js";
 
 const log = createSubsystemLogger("outbound/deliver");
 const TELEGRAM_TEXT_LIMIT = 4096;
-
-type SendMatrixMessage = (
-  to: string,
-  text: string,
-  opts?: {
-    cfg?: OpenClawConfig;
-    mediaUrl?: string;
-    replyToId?: string;
-    threadId?: string;
-    timeoutMs?: number;
-  },
-) => Promise<{ messageId: string; roomId: string }>;
-
-export type OutboundSendDeps = {
-  sendWhatsApp?: typeof sendMessageWhatsApp;
-  sendTelegram?: typeof sendMessageTelegram;
-  sendDiscord?: typeof sendMessageDiscord;
-  sendSlack?: typeof sendMessageSlack;
-  sendSignal?: typeof sendMessageSignal;
-  sendIMessage?: typeof sendMessageIMessage;
-  sendMatrix?: SendMatrixMessage;
-  sendMSTeams?: (
-    to: string,
-    text: string,
-    opts?: { mediaUrl?: string; mediaLocalRoots?: readonly string[] },
-  ) => Promise<{ messageId: string; conversationId: string }>;
-};
 
 export type OutboundDeliveryResult = {
   channel: Exclude<OutboundChannel, "none">;
@@ -132,6 +107,8 @@ type ChannelHandlerParams = {
   identity?: OutboundIdentity;
   deps?: OutboundSendDeps;
   gifPlayback?: boolean;
+  forceDocument?: boolean;
+  toolContext?: ChannelThreadingToolContext;
   silent?: boolean;
   mediaLocalRoots?: readonly string[];
 };
@@ -212,7 +189,9 @@ function createChannelOutboundContextBase(
     threadId: params.threadId,
     identity: params.identity,
     gifPlayback: params.gifPlayback,
+    forceDocument: params.forceDocument,
     deps: params.deps,
+    toolContext: params.toolContext,
     silent: params.silent,
     mediaLocalRoots: params.mediaLocalRoots,
   };
@@ -231,26 +210,19 @@ type DeliverOutboundPayloadsCoreParams = {
   identity?: OutboundIdentity;
   deps?: OutboundSendDeps;
   gifPlayback?: boolean;
+  forceDocument?: boolean;
+  toolContext?: ChannelThreadingToolContext;
   abortSignal?: AbortSignal;
   bestEffort?: boolean;
   onError?: (err: unknown, payload: NormalizedOutboundPayload) => void;
   onPayload?: (payload: NormalizedOutboundPayload) => void;
   /** Session/agent context used for hooks and media local-root scoping. */
   session?: OutboundSessionContext;
-  mirror?: {
-    sessionKey: string;
-    agentId?: string;
-    text?: string;
-    mediaUrls?: string[];
-    /** Whether this message is being sent in a group/channel context */
-    isGroup?: boolean;
-    /** Group or channel identifier for correlation with received events */
-    groupId?: string;
-  };
+  mirror?: DeliveryMirror;
   silent?: boolean;
 };
 
-type DeliverOutboundPayloadsParams = DeliverOutboundPayloadsCoreParams & {
+export type DeliverOutboundPayloadsParams = DeliverOutboundPayloadsCoreParams & {
   /** @internal Skip write-ahead queue (used by crash-recovery to avoid re-enqueueing). */
   skipQueue?: boolean;
 };
@@ -300,6 +272,9 @@ function normalizePayloadForChannelDelivery(
 function normalizePayloadsForChannelDelivery(
   payloads: ReplyPayload[],
   channel: Exclude<OutboundChannel, "none">,
+  _cfg: OpenClawConfig,
+  _to: string,
+  _accountId?: string,
 ): ReplyPayload[] {
   const normalizedPayloads: ReplyPayload[] = [];
   for (const payload of normalizeReplyPayloadsForDelivery(payloads)) {
@@ -307,10 +282,13 @@ function normalizePayloadsForChannelDelivery(
     // Strip HTML tags for plain-text surfaces (WhatsApp, Signal, etc.)
     // Models occasionally produce <br>, <b>, etc. that render as literal text.
     // See https://github.com/openclaw/openclaw/issues/31884
-    if (isPlainTextSurface(channel) && payload.text) {
+    if (isPlainTextSurface(channel) && sanitizedPayload.text) {
       // Telegram sendPayload uses textMode:"html". Preserve raw HTML in this path.
-      if (!(channel === "telegram" && payload.channelData)) {
-        sanitizedPayload = { ...payload, text: sanitizeForPlainText(payload.text) };
+      if (!(channel === "telegram" && sanitizedPayload.channelData)) {
+        sanitizedPayload = {
+          ...sanitizedPayload,
+          text: sanitizeForPlainText(sanitizedPayload.text),
+        };
       }
     }
     const normalized = normalizePayloadForChannelDelivery(sanitizedPayload, channel);
@@ -478,6 +456,7 @@ export async function deliverOutboundPayloads(
         replyToId: params.replyToId,
         bestEffort: params.bestEffort,
         gifPlayback: params.gifPlayback,
+        forceDocument: params.forceDocument,
         silent: params.silent,
         mirror: params.mirror,
       }).catch(() => null); // Best-effort — don't block delivery if queue write fails.
@@ -529,7 +508,8 @@ async function deliverOutboundPayloadsCore(
   const accountId = params.accountId;
   const deps = params.deps;
   const abortSignal = params.abortSignal;
-  const sendSignal = params.deps?.sendSignal ?? sendMessageSignal;
+  const sendSignal =
+    resolveOutboundSendDep<typeof sendMessageSignal>(params.deps, "signal") ?? sendMessageSignal;
   const mediaLocalRoots = getAgentScopedMediaLocalRoots(
     cfg,
     params.session?.agentId ?? params.mirror?.agentId,
@@ -545,6 +525,7 @@ async function deliverOutboundPayloadsCore(
     threadId: params.threadId,
     identity: params.identity,
     gifPlayback: params.gifPlayback,
+    forceDocument: params.forceDocument,
     silent: params.silent,
     mediaLocalRoots,
   });
@@ -662,7 +643,13 @@ async function deliverOutboundPayloadsCore(
       })),
     };
   };
-  const normalizedPayloads = normalizePayloadsForChannelDelivery(payloads, channel);
+  const normalizedPayloads = normalizePayloadsForChannelDelivery(
+    payloads,
+    channel,
+    cfg,
+    to,
+    accountId,
+  );
   const hookRunner = getGlobalHookRunner();
   const sessionKeyForInternalHooks = params.mirror?.sessionKey ?? params.session?.key;
   const mirrorIsGroup = params.mirror?.isGroup;
@@ -808,6 +795,7 @@ async function deliverOutboundPayloadsCore(
         agentId: params.mirror.agentId,
         sessionKey: params.mirror.sessionKey,
         text: mirrorText,
+        idempotencyKey: params.mirror.idempotencyKey,
       });
     }
   }
